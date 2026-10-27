@@ -1,4 +1,5 @@
-// ProcBar — a tiny menu bar monitor for RAM, Claude Code sessions and leftover dev processes.
+// ProcBar — a menu bar view of what Claude Code is running: each session, what it is doing right now,
+// every helper, server and simulator it started, and what is safe to stop.
 // Idle cost: one host_statistics64 call every 5s for the title, plus a CPU-time sample every 15s.
 // The full process scan only runs when the menu is opened.
 
@@ -195,9 +196,35 @@ func listeningPorts(_ pids: [pid_t]) -> [pid_t: [Int]] {
 
 // MARK: - Claude desktop session metadata
 
-struct SessionMeta { var title: String; var lastActivity: Date?; var permissionMode: String? }
+struct SessionMeta { var title: String; var lastActivity: Date?; var permissionMode: String?; var transcript: String? }
 
 let sessionsRoot = home + "/Library/Application Support/Claude/claude-code-sessions"
+let projectsRoot = home + "/.claude/projects"
+
+/// ~/.claude/projects/<slug>/<id>.jsonl, where the slug is the cwd with every non-alphanumeric character as "-".
+func transcriptPath(cwd: String, id: String) -> String? {
+    let slug = String(cwd.map { $0.isASCII && ($0.isLetter || $0.isNumber) ? $0 : "-" })
+    let direct = "\(projectsRoot)/\(slug)/\(id).jsonl"
+    if FileManager.default.fileExists(atPath: direct) { return direct }
+    // Worktree sessions can write under the original folder's slug.
+    for d in (try? FileManager.default.contentsOfDirectory(atPath: projectsRoot)) ?? [] {
+        let f = "\(projectsRoot)/\(d)/\(id).jsonl"
+        if FileManager.default.fileExists(atPath: f) { return f }
+    }
+    return nil
+}
+
+/// Terminal sessions have no desktop metadata: take the newest transcript in their folder.
+func newestTranscript(cwd: String, since: Date) -> String? {
+    let slug = String(cwd.map { $0.isASCII && ($0.isLetter || $0.isNumber) ? $0 : "-" })
+    let dir = "\(projectsRoot)/\(slug)"
+    let fm = FileManager.default
+    return ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).filter { $0.hasSuffix(".jsonl") }
+        .compactMap { f -> (String, Date)? in
+            guard let m = (try? fm.attributesOfItem(atPath: "\(dir)/\(f)"))?[.modificationDate] as? Date, m >= since else { return nil }
+            return ("\(dir)/\(f)", m)
+        }.max { $0.1 < $1.1 }?.0
+}
 
 func sessionMeta(_ hostId: String) -> SessionMeta? {
     let fm = FileManager.default
@@ -207,14 +234,14 @@ func sessionMeta(_ hostId: String) -> SessionMeta? {
             guard let d = fm.contents(atPath: f),
                   let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { continue }
             var last = (j["lastActivityAt"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) }
+            var transcript: String?
             // The CLI transcript is appended on every message/tool call, so its mtime is the freshest signal.
-            if let cli = j["cliSessionId"] as? String, let cwd = j["cwd"] as? String {
-                let slug = cwd.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ".", with: "-")
-                let t = "\(home)/.claude/projects/\(slug)/\(cli).jsonl"
+            if let cli = j["cliSessionId"] as? String, let cwd = j["cwd"] as? String, let t = transcriptPath(cwd: cwd, id: cli) {
+                transcript = t
                 if let m = (try? fm.attributesOfItem(atPath: t))?[.modificationDate] as? Date, m > (last ?? .distantPast) { last = m }
             }
             return SessionMeta(title: j["title"] as? String ?? "Untitled session", lastActivity: last,
-                               permissionMode: j["permissionMode"] as? String)
+                               permissionMode: j["permissionMode"] as? String, transcript: transcript)
         }
     }
     return nil
@@ -239,7 +266,86 @@ func gitBranch(_ dir: String) -> String? {
     return nil
 }
 
-// MARK: - Classification ("why is this running?")
+// MARK: - What a session is doing (read from the tail of its transcript)
+
+enum Activity {
+    case thinking(Date)               // Claude is writing a reply or about to call a tool
+    case usingTool(String, String, Date)  // tool name, plain-English summary
+    case needsAnswer(Date)            // asked you a question or is showing a plan
+    case finished(Date)               // turn ended: waiting for your next message
+    case interrupted(Date)            // you pressed stop
+    case unknown
+
+    var at: Date? {
+        switch self {
+        case .thinking(let d), .usingTool(_, _, let d), .needsAnswer(let d), .finished(let d), .interrupted(let d): return d
+        case .unknown: return nil
+        }
+    }
+}
+
+let isoFrac: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f }()
+
+func shortPath(_ s: String) -> String { (s as NSString).lastPathComponent }
+
+func clip(_ s: String, _ n: Int) -> String {
+    let one = s.split(whereSeparator: \.isNewline).first.map(String.init) ?? s
+    return one.count > n ? String(one.prefix(n - 1)) + "…" : one
+}
+
+func toolSummary(_ name: String, _ input: [String: Any]) -> String {
+    let str = { (k: String) in input[k] as? String ?? "" }
+    switch name {
+    case "Bash": return "running `\(clip(str("command"), 48))`"
+    case "Read": return "reading \(shortPath(str("file_path")))"
+    case "Edit", "MultiEdit": return "editing \(shortPath(str("file_path")))"
+    case "Write": return "writing \(shortPath(str("file_path")))"
+    case "Grep", "Glob": return "searching the code"
+    case "WebSearch": return "searching the web"
+    case "WebFetch": return "reading a web page"
+    case "Agent", "Task": return "running a subagent: \(clip(str("description"), 40))"
+    case "Monitor", "ScheduleWakeup": return "waiting on a timer or background job"
+    default:
+        if name.hasPrefix("mcp__") {
+            let parts = name.split(separator: "_", omittingEmptySubsequences: true)
+            let tool = parts.last.map(String.init) ?? name
+            let server = name.dropFirst(5).components(separatedBy: "__").first ?? ""
+            let friendly = server.count > 30 ? "a connector" : server.replacingOccurrences(of: "_", with: " ")
+            return "using \(friendly): \(tool.replacingOccurrences(of: "_", with: " "))"
+        }
+        return "using \(name)"
+    }
+}
+
+func readActivity(_ path: String) -> Activity {
+    guard let fh = FileHandle(forReadingAtPath: path) else { return .unknown }
+    defer { try? fh.close() }
+    let size = (try? fh.seekToEnd()) ?? 0
+    try? fh.seek(toOffset: size > 400_000 ? size - 400_000 : 0)
+    let data = fh.readDataToEndOfFile()
+    for line in data.split(separator: UInt8(ascii: "\n")).reversed() {
+        guard let j = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+              let type = j["type"] as? String, type == "user" || type == "assistant",
+              j["isSidechain"] as? Bool != true, j["isMeta"] as? Bool != true,
+              let msg = j["message"] as? [String: Any] else { continue }
+        let at = (j["timestamp"] as? String).flatMap { isoFrac.date(from: $0) } ?? Date()
+        if type == "user" {
+            let texts = (msg["content"] as? String).map { [$0] }
+                ?? (msg["content"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String }
+            return texts.contains { $0.hasPrefix("[Request interrupted") } ? .interrupted(at) : .thinking(at)
+        }
+        guard let last = (msg["content"] as? [[String: Any]])?.last else { continue }
+        if last["type"] as? String == "tool_use" {
+            let name = last["name"] as? String ?? "a tool"
+            if name == "AskUserQuestion" || name == "ExitPlanMode" { return .needsAnswer(at) }
+            return .usingTool(name, toolSummary(name, last["input"] as? [String: Any] ?? [:]), at)
+        }
+        return msg["stop_reason"] as? String == "end_turn" ? .finished(at) : .thinking(at)
+    }
+    return .unknown
+}
+
+// MARK: - Naming the things Claude starts
 
 /// The CLI binary has lived at …/MacOS/claude (desktop), ~/.local/bin/claude and
 /// …/@anthropic-ai/claude-code/bin/claude.exe (npm). An empty path means the binary was
@@ -256,78 +362,98 @@ func isClaudeSession(_ p: Proc) -> Bool {
     isClaudeBinary(p.path, p.name) || p.args.contains { $0.contains("@anthropic-ai/claude-code") }
 }
 
-let devToolNames: Set<String> = ["node", "bun", "deno", "npm", "npx", "pnpm", "yarn", "uv", "uvx", "vite",
-                                  "esbuild", "tsx", "ruby", "java", "cargo", "go", "deno", "watchman", "turbo"]
+let shells: Set<String> = ["zsh", "bash", "sh", "fish"]
 
-func isDevTool(_ p: Proc) -> Bool {
-    let n = p.name.lowercased()
-    return devToolNames.contains(n) || n.hasPrefix("python") || p.path.contains("/node_modules/")
+/// Claude's Bash tool runs `zsh -c "source snapshot && … && eval '<command>' …"`: pull out <command>.
+func shellCommand(_ p: Proc) -> String? {
+    guard let i = p.args.firstIndex(of: "-c"), i + 1 < p.args.count else { return nil }
+    let script = p.args[(i + 1)...].joined(separator: " ")
+    if let r = script.range(of: "eval '") {
+        var out = "", rest = script[r.upperBound...]
+        while let q = rest.firstIndex(of: "'") {
+            out += rest[..<q]
+            rest = rest[rest.index(after: q)...]
+            guard rest.hasPrefix("\\''") else { break }   // '\'' is an escaped quote
+            out += "'"; rest = rest.dropFirst(3)
+        }
+        return out
+    }
+    return script
 }
 
-func describeHelper(_ p: Proc) -> String {
-    let cmd = p.cmdline
-    let lc = cmd.lowercased()
-    if lc.contains("xcodebuildmcp") { return "XcodeBuildMCP server (iOS build tools for Claude)" }
-    if lc.contains("blender-mcp") || lc.contains("blender_mcp") { return "Blender MCP server (lets Claude drive Blender)" }
-    if lc.contains("mcp") {
-        let tool = p.args.first { $0.lowercased().contains("mcp") }.map { ($0 as NSString).lastPathComponent } ?? p.name
-        return "MCP server: \(tool)"
-    }
-    if ["zsh", "bash", "sh"].contains(p.name) { return "Shell running a command for Claude" }
-    if lc.contains("vite") { return "Vite dev server" }
-    if p.name == "esbuild" { return "esbuild (bundler used by Vite)" }
-    if p.name == "node" || p.name == "bun" || p.name == "tsx" {
-        let script = p.args.dropFirst().first { !$0.hasPrefix("-") }.map { ($0 as NSString).lastPathComponent } ?? ""
-        return script.isEmpty ? "Node process" : "Node: \(p.args.dropFirst().filter { !$0.hasPrefix("-") }.prefix(2).joined(separator: " "))"
-    }
-    if p.name.hasPrefix("python") {
-        let script = p.args.dropFirst().first { !$0.hasPrefix("-") }.map { ($0 as NSString).lastPathComponent } ?? ""
-        return "Python: \(script)"
-    }
-    return p.name
-}
-
-func describeClaudeHelper(_ p: Proc) -> String {
-    let a = p.cmdline
-    if a.contains("--type=gpu-process") { return "GPU process — draws the Claude window" }
-    if a.contains("--type=renderer") { return "Window/tab renderer — Claude's UI" }
-    if a.contains("NetworkService") { return "Network service" }
-    if a.contains("AudioService") { return "Audio service" }
-    if a.contains("video_capture") { return "Camera/screen capture service" }
-    if a.contains("node.mojom.NodeService") { return "Node helper (extensions, MCP connectors, previews)" }
-    if p.path.hasPrefix("/Applications/Claude.app") && p.ppid == 1 { return "Main Claude app" }
-    if !p.path.contains("Claude.app") { return describeHelper(p) + " — started by the Claude app" }
-    return p.name
-}
-
-let knownServices: [String: String] = [
-    "mds": "Spotlight — indexing files for search",
-    "mds_stores": "Spotlight — writing the search index",
-    "mdworker_shared": "Spotlight — reading files to index them",
-    "mdworker": "Spotlight — reading files to index them",
-    "WindowServer": "Draws everything on screen; busy when apps animate or redraw a lot",
-    "kernel_task": "macOS kernel; also throttles CPU when the Mac is hot",
-    "duetexpertd": "Siri/app suggestions learning from your usage",
-    "photoanalysisd": "Photos library analysis",
-    "mediaanalysisd": "Photos/video analysis",
-    "bird": "iCloud Drive sync", "cloudd": "iCloud sync",
-    "backupd": "Time Machine backup",
-    "softwareupdated": "Checking/installing macOS updates",
-    "corespotlightd": "Spotlight for app content",
-    "trustd": "Checking code signatures and certificates",
-    "syspolicyd": "Gatekeeper checking apps you run",
-    "XprotectService": "Malware scanning", "XProtect": "Malware scanning",
-    "logd": "System logging",
-    "launchd": "Starts and manages every process",
-    "contactsd": "Contacts sync", "suggestd": "Siri suggestions",
-    "fseventsd": "Tracks file changes (heavy during big file writes/npm installs)",
-    "MTLCompilerService": "Compiling GPU shaders for an app",
-    "coreaudiod": "Audio", "bluetoothd": "Bluetooth",
+let friendlyMcp: [String: String] = [
+    "xcodebuildmcp": "XcodeBuildMCP (Xcode + simulator tools)",
+    "blender-mcp": "Blender MCP", "playwright": "Playwright (browser automation)",
+    "chrome-devtools-mcp": "Chrome DevTools", "github-mcp-server": "GitHub",
 ]
 
-func appBundleName(_ path: String) -> String? {
-    guard let r = path.range(of: ".app/") else { return nil }
-    return (String(path[..<r.lowerBound]) as NSString).lastPathComponent
+func mcpName(_ p: Proc) -> String? {
+    guard p.cmdline.lowercased().contains("mcp") else { return nil }
+    // npm rewrites its process title, so its whole command line can arrive as one argument.
+    let words = p.args.flatMap { $0.split(separator: " ").map(String.init) }
+    let arg = words.dropFirst().first { !$0.hasPrefix("-") && $0.lowercased().contains("mcp") } ?? p.name
+    var name = shortPath(arg)
+    if let at = name.lastIndex(of: "@"), at != name.startIndex { name = String(name[..<at]) }
+    for ext in [".js", ".mjs", ".py", ".ts"] where name.hasSuffix(ext) { name = String(name.dropLast(ext.count)) }
+    return friendlyMcp[name.lowercased()] ?? name
+}
+
+func serverName(_ p: Proc) -> String {
+    let lc = p.cmdline.lowercased()
+    if lc.contains("http.server") { return "Python web server" }
+    if lc.contains("vite") { return "Vite dev server" }
+    if lc.contains("next") && lc.contains("dev") { return "Next.js dev server" }
+    if lc.contains("expo") || lc.contains("metro") { return "Expo / Metro bundler" }
+    if lc.contains("webpack") { return "Webpack dev server" }
+    if p.name == "esbuild" { return "esbuild bundler" }
+    if p.name.hasPrefix("python") || p.name == "Python" {
+        return "Python: " + (p.args.dropFirst().first { !$0.hasPrefix("-") }.map(shortPath) ?? "script")
+    }
+    if ["node", "bun", "deno", "tsx"].contains(p.name) {
+        let script = p.args.dropFirst().filter { !$0.hasPrefix("-") }.prefix(2).map(shortPath).joined(separator: " ")
+        return script.isEmpty ? "Node process" : "Node: \(script)"
+    }
+    return clip(p.cmdline, 50)
+}
+
+enum Kind { case agent, plugin, command, background, codeIntel, preview, other }
+
+/// One line in a session: a direct child of Claude (or a server the Claude app started for it), with its whole subtree.
+struct Part {
+    let proc: Proc, kind: Kind, label: String, explain: String
+    var mem: UInt64, cpu: Double, pids: [pid_t], ports: [Int] = []
+}
+
+func describePart(_ p: Proc, sessionBusy: Bool) -> (Kind, String, String) {
+    if shells.contains(p.name), let cmd = shellCommand(p) {
+        return sessionBusy
+            ? (.command, "Running `\(clip(cmd, 50))`", "A command Claude is running for the current task.")
+            : (.background, "Still running `\(clip(cmd, 46))`",
+               "Claude started this in the background and it outlived the task. Usually safe to stop.")
+    }
+    if let m = mcpName(p) {
+        return (.plugin, "Tool plug-in: \(m)",
+                "An MCP server that gives Claude extra tools. Sits idle until Claude uses it. Every session starts its own copy.")
+    }
+    if p.cmdline.contains("lsp") || p.cmdline.contains("language-server") {
+        return (.codeIntel, "Code intelligence: \(p.name)", "Helps Claude jump to definitions and see compiler errors.")
+    }
+    return (.other, serverName(p), "Started by Claude.")
+}
+
+func describeAppPart(_ p: Proc) -> String {
+    let a = p.cmdline
+    if a.contains("--type=gpu-process") { return "Drawing the window (GPU)" }
+    if a.contains("--type=renderer") { return "Window contents (chat, panes, previews)" }
+    if a.contains("NetworkService") { return "Network" }
+    if a.contains("AudioService") { return "Audio" }
+    if a.contains("video_capture") { return "Camera / screen capture" }
+    if a.contains("node.mojom.NodeService") { return "Background helper (connectors, terminal, previews)" }
+    if p.path.contains("claude-ios-sim") { return "iOS simulator viewer panel" }
+    if p.name == "chrome-native-host" { return "Claude in Chrome bridge" }
+    if shells.contains(p.name) { return "Terminal tab" }
+    if p.path.hasPrefix("/Applications/Claude.app/Contents/MacOS/") { return "Main app" }
+    return p.name
 }
 
 // MARK: - Killing
@@ -347,115 +473,176 @@ func killTree(_ pids: [pid_t]) {
     }
 }
 
-// MARK: - Menu model
+func shutdownSimulator(_ udid: String) {
+    let t = Process()
+    t.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+    t.arguments = ["simctl", "shutdown", udid]
+    try? t.run()
+}
+
+// MARK: - Model: everything Claude is running, grouped by session
 
 struct SessionInfo {
     let proc: Proc, title: String, folder: String?, branch: String?
     let lastActivity: Date?, permissionMode: String?, fromDesktop: Bool
-    let helpers: [(proc: Proc, mem: UInt64)], treeMem: UInt64, treeCpu: Double, treePids: [pid_t]
-    let runningCommand: Bool  // a shell child means a tool call is in progress
-    var isWorking: Bool {
-        runningCommand || treeCpu > 5 || (lastActivity.map { Date().timeIntervalSince($0) < 180 } ?? false)
+    let activity: Activity
+    var parts: [Part]
+    var mem: UInt64 { parts.map(\.mem).reduce(0, +) }
+    var cpu: Double { parts.map(\.cpu).reduce(0, +) }
+    var pids: [pid_t] { parts.flatMap(\.pids) }
+    var leftovers: [Part] { parts.filter { $0.kind == .background || $0.kind == .preview } }
+
+    /// Is Claude in the middle of a turn? A transcript that has gone quiet for 15 minutes mid-turn means
+    /// the session hung or is waiting on a permission prompt, not that it's working.
+    var isBusy: Bool {
+        if parts.contains(where: { $0.kind == .command }) { return true }
+        switch activity {
+        case .thinking(let d), .usingTool(_, _, let d): return Date().timeIntervalSince(d) < 900 || cpu > 5
+        case .needsAnswer, .finished, .interrupted: return false
+        case .unknown: return cpu > 5 || (lastActivity.map { Date().timeIntervalSince($0) < 180 } ?? false)
+        }
+    }
+    /// Nothing will be lost by stopping it: the turn is over and has been for a few minutes.
+    var isDone: Bool {
+        if isBusy { return false }
+        if case .needsAnswer = activity { return false }
+        let since = activity.at ?? lastActivity ?? proc.started
+        return Date().timeIntervalSince(since) > 120
     }
 }
 
+struct Simulator { let udid: String, name: String, apps: [String], mem: UInt64, cpu: Double, started: Date }
+
 final class Model {
     var sessions: [SessionInfo] = []
-    var leftovers: [(proc: Proc, why: String, folder: String?, ports: [Int], pids: [pid_t], mem: UInt64)] = []
-    var claudeApp: (mem: UInt64, cpu: Double, parts: [Proc]) = (0, 0, [])
-    var apps: [(name: String, mem: UInt64, cpu: Double, bundle: String, pids: [pid_t])] = []
-    var busyServices: [(name: String, why: String, cpu: Double, mem: UInt64, count: Int)] = []
-    var background: [(name: String, why: String, mem: UInt64, count: Int)] = []
+    var orphans: [(part: Part, from: String?, folder: String?)] = []
+    var unmatchedPreviews: [(part: Part, folder: String?)] = []
+    var simulators: [Simulator] = []
+    var app: (mem: UInt64, cpu: Double, parts: [(label: String, mem: UInt64, cpu: Double)]) = (0, 0, [])
+
+    var claudeTotal: UInt64 {
+        sessions.map(\.mem).reduce(0, +) + orphans.map(\.part.mem).reduce(0, +)
+            + unmatchedPreviews.map(\.part.mem).reduce(0, +) + app.mem
+    }
 
     init(procs: [pid_t: Proc]) {
         var children: [pid_t: [pid_t]] = [:]
         for p in procs.values { children[p.ppid, default: []].append(p.pid) }
         var claimed = Set<pid_t>()
+        func tree(_ pid: pid_t) -> [pid_t] { descendants(of: pid, children: children) }
+        func mem(_ pids: [pid_t]) -> UInt64 { pids.compactMap { procs[$0]?.mem }.reduce(0, +) }
+        func cpu(_ pids: [pid_t]) -> Double { pids.compactMap { procs[$0]?.cpuPct }.reduce(0, +) }
 
-        // Claude Code sessions (desktop or terminal), with every helper they spawned.
+        // Sessions (desktop or terminal): Claude itself plus one part per direct child, subtree folded in.
         func hasClaudeAncestor(_ p: Proc) -> Bool {
             var cur = procs[p.ppid]
             while let c = cur, c.pid > 1 { if isClaudeSession(c) { return true }; cur = procs[c.ppid] }
             return false
         }
-        let sessionProcs = procs.values.filter { isClaudeSession($0) && !hasClaudeAncestor($0) }
-        for s in sessionProcs {
-            let tree = descendants(of: s.pid, children: children)
-            claimed.formUnion(tree)
-            // One row per direct child, with its own sub-processes folded into its memory.
-            let helpers = (children[s.pid] ?? []).compactMap { procs[$0] }.map { h in
-                (proc: h, mem: descendants(of: h.pid, children: children).compactMap { procs[$0]?.mem }.reduce(0, +))
-            }
-            let runningCommand = helpers.contains { ["zsh", "bash", "sh"].contains($0.proc.name) }
-            let hostId = s.env["CLAUDE_CODE_HOST_SESSION_ID"]
-            let meta = hostId.flatMap(sessionMeta)
+        for s in procs.values where isClaudeSession(s) && !hasClaudeAncestor(s) {
+            claimed.formUnion(tree(s.pid))
+            let meta = s.env["CLAUDE_CODE_HOST_SESSION_ID"].flatMap(sessionMeta)
             let folder = cwd(s.pid)
-            let fromDesktop = s.env["CLAUDE_CODE_ENTRYPOINT"] == "claude-desktop" || s.path.contains("Application Support/Claude")
-            let mem = tree.compactMap { procs[$0]?.mem }.reduce(0, +)
-            let cpu = tree.compactMap { procs[$0]?.cpuPct }.reduce(0, +)
+            let transcript = meta?.transcript ?? folder.flatMap { newestTranscript(cwd: $0, since: s.started) }
+            let activity = transcript.map(readActivity) ?? .unknown
+            let kids = (children[s.pid] ?? []).compactMap { procs[$0] }
+            // A shell child while the turn is over can only be a background command.
+            let turnOver: Bool = { switch activity { case .finished, .interrupted, .needsAnswer: return true; default: return false } }()
+            var parts = [Part(proc: s, kind: .agent, label: "Claude (the session itself)",
+                              explain: "Holds the conversation. Comes back when you reopen the chat.",
+                              mem: s.mem, cpu: s.cpuPct, pids: [s.pid])]
+            for k in kids {
+                let (kind, label, explain) = describePart(k, sessionBusy: !turnOver)
+                let t = tree(k.pid)
+                parts.append(Part(proc: k, kind: kind, label: label, explain: explain, mem: mem(t), cpu: cpu(t), pids: t))
+            }
             let mode = meta?.permissionMode ?? s.args.first { $0.hasPrefix("--permission-mode=") }.map { String($0.dropFirst(18)) }
             sessions.append(SessionInfo(
-                proc: s, title: meta?.title ?? (folder.map { ($0 as NSString).lastPathComponent } ?? "Claude Code"),
+                proc: s, title: meta?.title ?? (folder.map(shortPath) ?? "Claude Code"),
                 folder: folder, branch: folder.flatMap(gitBranch), lastActivity: meta?.lastActivity,
-                permissionMode: mode, fromDesktop: fromDesktop,
-                helpers: helpers.sorted { $0.mem > $1.mem }, treeMem: mem, treeCpu: cpu, treePids: tree,
-                runningCommand: runningCommand))
-        }
-        sessions.sort { ($0.lastActivity ?? $0.proc.started) > ($1.lastActivity ?? $1.proc.started) }
-
-        // Claude desktop app itself (and anything it spawned that isn't a session).
-        if let main = procs.values.first(where: { $0.path.hasPrefix("/Applications/Claude.app/Contents/MacOS/") }) {
-            let tree = descendants(of: main.pid, children: children).filter { !claimed.contains($0) }
-            let parts = tree.compactMap { procs[$0] }.filter { $0.name != "disclaimer" }
-            claimed.formUnion(tree)
-            claudeApp = (parts.map(\.mem).reduce(0, +), parts.map(\.cpuPct).reduce(0, +), parts.sorted { $0.mem > $1.mem })
+                permissionMode: mode,
+                fromDesktop: s.env["CLAUDE_CODE_ENTRYPOINT"] == "claude-desktop" || s.path.contains("Application Support/Claude"),
+                activity: activity, parts: parts))
         }
 
-        // Leftover dev processes: my dev tools whose parent died (adopted by launchd).
-        var leftoverPids: [pid_t] = []
-        for p in procs.values where p.uid == myUid && p.ppid == 1 && !claimed.contains(p.pid) && isDevTool(p) && appBundleName(p.path) == nil {
-            leftoverPids.append(p.pid)
-        }
-        let ports = listeningPorts(leftoverPids)
-        for pid in leftoverPids {
-            guard let p = procs[pid] else { continue }
-            let tree = descendants(of: pid, children: children)
-            claimed.formUnion(tree)
-            let folder = cwd(pid)
-            leftovers.append((p, describeHelper(p), folder, ports[pid] ?? [], tree, tree.compactMap { procs[$0]?.mem }.reduce(0, +)))
-        }
-        leftovers.sort { $0.mem > $1.mem }
-
-        // Other apps grouped by bundle; system services that are busy right now.
-        var byApp: [String: (mem: UInt64, cpu: Double, bundle: String, pids: [pid_t])] = [:]
-        var bySvc: [String: (cpu: Double, mem: UInt64, count: Int)] = [:]
-        for p in procs.values where !claimed.contains(p.pid) {
-            if let app = appBundleName(p.path), !p.path.hasPrefix("/System/") || p.path.contains("/Applications/") {
-                if p.uid != myUid { continue }  // root-owned: unreadable, counted in the system remainder
-                var e = byApp[app] ?? (0, 0, String(p.path[..<p.path.range(of: ".app/")!.lowerBound]) + ".app", [])
-                e.mem += p.mem; e.cpu += p.cpuPct; e.pids.append(p.pid)
-                byApp[app] = e
-            } else {
-                let key = p.name.hasPrefix("mdworker") ? "mdworker_shared" : p.name
-                var e = bySvc[key] ?? (0, 0, 0)
-                e.cpu += p.cpuPct; e.mem += p.mem; e.count += 1
-                bySvc[key] = e
+        // Servers the Claude app started for a session (preview panes): `disclaimer` wrappers under the app
+        // whose child isn't a session. They run in the project folder, which ties them to a session.
+        let mainApp = procs.values.first { $0.path.hasPrefix("/Applications/Claude.app/Contents/MacOS/") && $0.ppid == 1 }
+        if let main = mainApp {
+            for w in (children[main.pid] ?? []).compactMap({ procs[$0] }) where w.name == "disclaimer" && !claimed.contains(w.pid) {
+                guard let child = (children[w.pid] ?? []).compactMap({ procs[$0] }).first,
+                      !isClaudeSession(child), !child.path.contains("claude-ios-sim") else { continue }
+                let t = tree(w.pid)
+                claimed.formUnion(t)
+                let dir = cwd(child.pid)
+                let part = Part(proc: child, kind: .preview, label: "Preview server: \(serverName(child))",
+                                explain: "Started by the Claude app to show a preview of this project.",
+                                mem: mem(t), cpu: cpu(t), pids: t)
+                let match = sessions.indices.filter { i in
+                    guard let f = sessions[i].folder, let d = dir else { return false }
+                    return d == f || d.hasPrefix(f + "/")
+                }.max { (sessions[$0].folder?.count ?? 0) < (sessions[$1].folder?.count ?? 0) }
+                if let i = match { sessions[i].parts.append(part) } else { unmatchedPreviews.append((part, dir)) }
             }
         }
-        apps = byApp.map { ($0.key, $0.value.mem, $0.value.cpu, $0.value.bundle, $0.value.pids) }.sorted { $0.mem > $1.mem }
-        var bg: [String: (mem: UInt64, count: Int)] = [:]
-        // Everything mine not shown as an app, including Finder/Dock/Control Center (system .app bundles).
-        let inApps = Set(byApp.values.flatMap(\.pids))
-        for p in procs.values where !claimed.contains(p.pid) && p.uid == myUid && !inApps.contains(p.pid) {
-            let key = p.name.hasPrefix("mdworker") ? "mdworker_shared" : p.name
-            bg[key, default: (0, 0)].mem += p.mem; bg[key, default: (0, 0)].count += 1
+        sessions.sort { ($0.activity.at ?? $0.lastActivity ?? $0.proc.started) > ($1.activity.at ?? $1.lastActivity ?? $1.proc.started) }
+
+        // Left behind: processes still carrying Claude's environment after their session exited (launchd adopted them).
+        for p in procs.values where p.uid == myUid && p.ppid == 1 && !claimed.contains(p.pid) && !isClaudeSession(p) {
+            let hostId = p.env["CLAUDE_CODE_HOST_SESSION_ID"]
+            guard p.env["CLAUDECODE"] == "1" || hostId != nil || p.env["CLAUDE_CODE_SESSION_ID"] != nil else { continue }
+            let t = tree(p.pid)
+            claimed.formUnion(t)
+            var (kind, label, _) = describePart(p, sessionBusy: false)
+            if kind == .background || kind == .other { label = serverName(procs[t.last ?? p.pid] ?? p) }
+            if shells.contains(p.name), let cmd = shellCommand(p) { label = "`\(clip(cmd, 50))`" }
+            orphans.append((Part(proc: p, kind: kind, label: label, explain: "", mem: mem(t), cpu: cpu(t), pids: t),
+                            hostId.flatMap(sessionMeta)?.title, cwd(p.pid)))
         }
-        background = bg.map { k, v in (k, knownServices[k] ?? "", v.mem, v.count) }
-            .sorted { $0.mem > $1.mem }
-        busyServices = bySvc.filter { $0.value.cpu >= 15 }.map { k, v in
-            (k, knownServices[k] ?? "System/background process", v.cpu, v.mem, v.count)
-        }.sorted { $0.cpu > $1.cpu }
+        orphans.sort { $0.part.mem > $1.part.mem }
+
+        // The Claude app itself: everything else under it.
+        if let main = mainApp {
+            let t = tree(main.pid).filter { !claimed.contains($0) }
+            claimed.formUnion(t)
+            var byLabel: [String: (UInt64, Double)] = [:]
+            for p in t.compactMap({ procs[$0] }) where p.name != "disclaimer" {
+                var label = describeAppPart(p)
+                if label == "Terminal tab" {
+                    let busy = (children[p.pid] ?? []).compactMap { procs[$0] }.first
+                    label = busy.map { "Terminal tab running \(serverName($0))" } ?? "Terminal tabs (idle)"
+                }
+                byLabel[label, default: (0, 0)].0 += p.mem; byLabel[label, default: (0, 0)].1 += p.cpuPct
+            }
+            app.parts = byLabel.map { ($0.key, $0.value.0, $0.value.1) }.sorted { $0.mem > $1.mem }
+            app.mem = app.parts.map(\.mem).reduce(0, +); app.cpu = app.parts.map(\.cpu).reduce(0, +)
+        }
+
+        // Booted iOS simulators (usually from XcodeBuildMCP or the app's simulator panel).
+        for p in procs.values where p.name == "launchd_sim" {
+            guard let r = p.cmdline.range(of: #"Devices/([0-9A-F-]{36})"#, options: .regularExpression) else { continue }
+            let udid = String(p.cmdline[r].dropFirst(8))
+            let t = tree(p.pid)
+            let plist = NSDictionary(contentsOfFile: "\(home)/Library/Developer/CoreSimulator/Devices/\(udid)/device.plist")
+            let apps = t.compactMap { procs[$0] }.filter { $0.path.contains("/Containers/Bundle/Application/") }
+                .compactMap { appName($0.path) }
+            simulators.append(Simulator(udid: udid, name: plist?["name"] as? String ?? "Simulator", apps: apps,
+                                        mem: mem(t), cpu: cpu(t), started: p.started))
+        }
+
+        // One lsof call for every port in play.
+        let all = sessions.flatMap(\.pids) + orphans.flatMap(\.part.pids) + unmatchedPreviews.flatMap(\.part.pids)
+        let ports = listeningPorts(all)
+        func withPorts(_ p: Part) -> Part { var q = p; q.ports = p.pids.flatMap { ports[$0] ?? [] }.sorted(); return q }
+        for i in sessions.indices { sessions[i].parts = sessions[i].parts.map(withPorts) }
+        orphans = orphans.map { (withPorts($0.part), $0.from, $0.folder) }
+        unmatchedPreviews = unmatchedPreviews.map { (withPorts($0.part), $0.folder) }
     }
+}
+
+func appName(_ path: String) -> String? {
+    guard let r = path.range(of: ".app/") else { return nil }
+    return shortPath(String(path[..<r.lowerBound]))
 }
 
 // MARK: - App
@@ -519,6 +706,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: menu building
 
+    func status(_ s: SessionInfo) -> (dot: String, color: NSColor, text: String) {
+        let ago = { (d: Date?) in fmtAgo(Date().timeIntervalSince(d ?? s.proc.started)) }
+        let bg = s.leftovers.filter { $0.kind == .background }.count
+        let bgNote = bg > 0 ? " · \(bg) background command\(bg == 1 ? "" : "s") still running" : ""
+        if let c = s.parts.first(where: { $0.kind == .command }) {
+            return ("●", .systemGreen, "Working — " + c.label.prefix(1).lowercased() + c.label.dropFirst())
+        }
+        switch s.activity {
+        case .usingTool(let name, let what, let d) where s.isBusy:
+            // Bash with no shell running, quiet for a while: the command is waiting on a permission prompt.
+            if ["Bash", "Edit", "Write"].contains(name), Date().timeIntervalSince(d) > 30, s.cpu < 2 {
+                return ("?", .systemOrange, "Probably waiting for your approval — \(what)")
+            }
+            return ("●", .systemGreen, "Working — \(what)")
+        case .thinking where s.isBusy: return ("●", .systemGreen, "Working — thinking")
+        case .needsAnswer(let d): return ("?", .systemOrange, "Asked you a question \(ago(d)) ago — waiting for your answer")
+        case .finished(let d): return ("✓", .secondaryLabelColor, "Finished \(ago(d)) ago, waiting for you" + bgNote)
+        case .interrupted(let d): return ("■", .secondaryLabelColor, "Stopped by you \(ago(d)) ago" + bgNote)
+        case .unknown where s.isBusy: return ("●", .systemGreen, "Working")
+        default: return ("○", .secondaryLabelColor, "Idle \(ago(s.activity.at ?? s.lastActivity)) — nothing happening" + bgNote)
+        }
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         actions.removeAll()
@@ -528,170 +738,191 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sessionCount = model.sessions.count
         updateTitle()
 
-        let m = memStats()
-        // Ledger: every row is a slice of "used", and the rows add up to it exactly.
-        let sMem = model.sessions.map(\.treeMem).reduce(0, +)
-        let lMem = model.leftovers.map(\.mem).reduce(0, +)
-        let shownApps = model.apps.prefix(4)
-        let restApps = model.apps.dropFirst(4)
-        let bgMem = model.background.map(\.mem).reduce(0, +)
-        let mine = model.claudeApp.mem + sMem + lMem + model.apps.map(\.mem).reduce(0, +) + bgMem
-        let system = m.used > mine + m.wired ? m.used - mine - m.wired : 0
+        let busy = model.sessions.filter(\.isBusy)
+        let done = model.sessions.filter(\.isDone)
+        let waiting = model.sessions.count - busy.count - done.count
+        let cpuTotal = model.sessions.map(\.cpu).reduce(0, +) + model.app.cpu
 
-        header("Memory used: \(fmtBytes(m.used)) of \(fmtBytes(m.total))")
-        info("Pressure \(m.pressureName) · swap \(fmtBytes(m.swapUsed)) · every row below adds up to this")
-
-        if model.claudeApp.mem > 0 {
-            let sub = NSMenu()
-            subInfo(sub, "The Claude desktop app window and its built-in services")
-            for p in model.claudeApp.parts.prefix(14) {
-                subInfo(sub, "\(describeClaudeHelper(p)) — \(fmtBytes(p.mem))" + (p.cpuPct >= 1 ? String(format: " · %.0f%% CPU", p.cpuPct) : ""))
-            }
-            ledger("Claude app" + cpuNote(model.claudeApp.cpu), model.claudeApp.mem, sub)
-        }
-        if !model.sessions.isEmpty { ledger("Claude Code sessions (\(model.sessions.count)) — details below", sMem) }
-        if !model.leftovers.isEmpty { ledger("Leftover dev processes (\(model.leftovers.count)) — details below", lMem) }
-        for a in shownApps { ledger(a.name + cpuNote(a.cpu), a.mem, appMenu(a.bundle, a.pids)) }
-        if !restApps.isEmpty {
-            let sub = NSMenu()
-            for a in restApps.prefix(40) {
-                let row = NSMenuItem(title: "\(a.name) — \(fmtBytes(a.mem))", action: nil, keyEquivalent: "")
-                row.submenu = appMenu(a.bundle, a.pids)
-                sub.addItem(row)
-            }
-            ledger("Other apps (\(restApps.count))", restApps.map(\.mem).reduce(0, +), sub)
-        }
-        let bgSub = NSMenu()
-        subInfo(bgSub, "Small processes with no window: menu bar items, helpers, agents, shells")
-        bgSub.addItem(.separator())
-        for b in model.background.prefix(30) {
-            subInfo(bgSub, "\(b.name)\(b.count > 1 ? " ×\(b.count)" : "") — \(fmtBytes(b.mem))" + (b.why.isEmpty ? "" : " · \(b.why)"))
-        }
-        if model.background.count > 30 {
-            let rest = model.background.dropFirst(30)
-            subInfo(bgSub, "…and \(rest.count) more — \(fmtBytes(rest.map(\.mem).reduce(0, +)))")
-        }
-        ledger("Background processes (\(model.background.map(\.count).reduce(0, +)))", bgMem, bgSub)
-        let wSub = NSMenu()
-        subInfo(wSub, "Memory the macOS kernel and graphics chip have locked in place.")
-        subInfo(wSub, "On Apple Silicon the GPU shares RAM, so graphics for Chrome tabs,")
-        subInfo(wSub, "games and app windows are counted here, not under the app.")
-        ledger("Graphics (GPU) + macOS kernel", m.wired, wSub)
-        let sysSub = NSMenu()
-        subInfo(sysSub, "System-owned processes (WindowServer, Spotlight, etc.) that")
-        subInfo(sysSub, "macOS won't let other apps measure one by one, plus shared memory.")
-        subInfo(sysSub, "Includes \(fmtBytes(m.compressed)) of compressed memory.")
-        ledger("macOS system processes", system, sysSub)
-        let total = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        total.attributedTitle = tabbed("Total", fmtBytes(model.claudeApp.mem + sMem + lMem + model.apps.map(\.mem).reduce(0, +) + bgMem + m.wired + system), bold: true)
-        menu.addItem(total)
-        info("Not counted: \(fmtBytes(m.cached)) of cached files (freed instantly when an app needs it)")
-        var load = [Double](repeating: 0, count: 3); getloadavg(&load, 3)
-        info(String(format: "CPU load %.1f on %d cores — above %d means things are waiting", load[0],
-                    ProcessInfo.processInfo.activeProcessorCount, ProcessInfo.processInfo.activeProcessorCount))
+        header("Claude is using \(fmtBytes(model.claudeTotal)) of RAM" + cpuNote(cpuTotal))
+        var counts = ["\(busy.count) working"]
+        if waiting > 0 { counts.append("\(waiting) waiting for you") }
+        if !done.isEmpty { counts.append("\(done.count) finished") }
+        info(model.sessions.isEmpty ? "No Claude Code sessions running" : "\(model.sessions.count) sessions: " + counts.joined(separator: ", "))
         menu.addItem(.separator())
 
-        // Claude sessions
-        header("Claude Code sessions (\(model.sessions.count)) — \(fmtBytes(sMem))")
-        if model.sessions.isEmpty { info("None running") }
+        // Sessions: one two-line row each, with what it's doing and what it's running.
         for s in model.sessions {
-            let state = s.isWorking ? "● working" : "○ idle " + fmtAgo(Date().timeIntervalSince(s.lastActivity ?? s.proc.started))
-            let row = NSMenuItem(title: "\(s.title) — \(fmtBytes(s.treeMem)) · \(state)", action: nil, keyEquivalent: "")
-            let sub = NSMenu()
-            subInfo(sub, "Why: Claude Code session " + (s.fromDesktop ? "kept alive by the Claude app (open in its sidebar)" : "started from a terminal"))
-            if let f = s.folder { subInfo(sub, "Folder: \(tilde(f))" + (s.branch.map { " (branch \($0))" } ?? "")) }
-            subInfo(sub, "Running \(fmtAgo(Date().timeIntervalSince(s.proc.started)))" +
-                    (s.lastActivity.map { " · last activity \(fmtAgo(Date().timeIntervalSince($0))) ago" } ?? "") +
-                    String(format: " · CPU %.0f%%", s.treeCpu))
-            if let pm = s.permissionMode { subInfo(sub, "Permission mode: \(pm)") }
-            subInfo(sub, "Claude itself: \(fmtBytes(s.proc.mem)) (pid \(s.proc.pid))")
-            if !s.helpers.isEmpty {
-                sub.addItem(.separator())
-                subHeader(sub, "Helpers it started (\(s.helpers.count))")
-                for h in s.helpers { subInfo(sub, "\(describeHelper(h.proc)) — \(fmtBytes(h.mem))") }
-            }
-            sub.addItem(.separator())
-            subAction(sub, "Force Quit session + helpers (frees \(fmtBytes(s.treeMem)))") { [weak self] in
-                if s.isWorking, self?.confirm("“\(s.title)” looks busy right now. Force quit it anyway?",
-                                              "Its current turn will be cut off. The session stays in the Claude sidebar and restarts when you open it.") != true { return }
-                killTree(s.treePids)
-            }
-            row.submenu = sub
+            let st = status(s)
+            let row = twoLine(dot: st.dot, dotColor: st.color, title: clip(s.title, 46), right: fmtBytes(s.mem), sub: st.text)
+            row.submenu = sessionMenu(s)
             menu.addItem(row)
         }
-        let idle = model.sessions.filter { !$0.isWorking }
-        if idle.count > 0 {
-            action("Force Quit \(idle.count) idle session\(idle.count == 1 ? "" : "s") (frees \(fmtBytes(idle.map(\.treeMem).reduce(0, +))))") {
-                for s in idle { killTree(s.treePids) }
-            }
-        }
-        menu.addItem(.separator())
 
-        // Leftovers
-        if !model.leftovers.isEmpty {
-            header("Leftover dev processes (\(model.leftovers.count)) — \(fmtBytes(model.leftovers.map(\.mem).reduce(0, +)))")
-            for l in model.leftovers {
-                let port = l.ports.isEmpty ? "" : " · :" + l.ports.map(String.init).joined(separator: ", :")
-                let row = NSMenuItem(title: "\(l.why)\(port) — \(fmtBytes(l.mem))", action: nil, keyEquivalent: "")
+        // Left behind by sessions that already exited.
+        if !model.orphans.isEmpty {
+            menu.addItem(.separator())
+            header("Left running after Claude quit (\(model.orphans.count)) — \(fmtBytes(model.orphans.map(\.part.mem).reduce(0, +)))")
+            for o in model.orphans {
+                let where_ = o.from.map { "from “\(clip($0, 30))”" } ?? o.folder.map { "in \(tilde($0))" } ?? ""
+                let row = twoLine(dot: "!", dotColor: .systemOrange, title: o.part.label + portNote(o.part.ports),
+                                  right: fmtBytes(o.part.mem),
+                                  sub: "Nothing will stop this · \(where_) · up \(fmtAgo(Date().timeIntervalSince(o.part.proc.started)))")
                 let sub = NSMenu()
-                subInfo(sub, "Why: whatever started it (a closed session or terminal) is gone, so nothing will stop it")
-                if let f = l.folder { subInfo(sub, "Folder: \(tilde(f))") }
-                subInfo(sub, "Running \(fmtAgo(Date().timeIntervalSince(l.proc.started))) · pid \(l.proc.pid)" + String(format: " · CPU %.0f%%", l.proc.cpuPct))
-                subInfo(sub, String(l.proc.cmdline.prefix(90)))
-                if let port = l.ports.first {
-                    subAction(sub, "Open http://localhost:\(port)") { NSWorkspace.shared.open(URL(string: "http://localhost:\(port)")!) }
-                }
+                subInfo(sub, "The session that started this has exited, so it will run until you stop it or restart.")
+                if let f = o.folder { subInfo(sub, "Folder: \(tilde(f))") }
+                subInfo(sub, clip(o.part.proc.cmdline, 90))
                 sub.addItem(.separator())
-                subAction(sub, "Force Quit") { killTree(l.pids) }
+                partActions(sub, o.part)
                 row.submenu = sub
                 menu.addItem(row)
             }
-            action("Force Quit all leftovers") { for l in model.leftovers { killTree(l.pids) } }
-            menu.addItem(.separator())
         }
 
-        if !model.busyServices.isEmpty {
-            header("Busy system services")
-            for s in model.busyServices.prefix(5) {
-                let count = s.count > 1 ? " ×\(s.count)" : ""
-                info(String(format: "%@%@ — %.0f%% CPU: %@", s.name, count, s.cpu, s.why))
+        if !model.unmatchedPreviews.isEmpty {
+            menu.addItem(.separator())
+            header("Preview servers the Claude app started")
+            for p in model.unmatchedPreviews {
+                let row = twoLine(dot: "◆", dotColor: .systemBlue, title: p.part.label + portNote(p.part.ports),
+                                  right: fmtBytes(p.part.mem), sub: p.folder.map { "In \(tilde($0)) · no open session for this folder" } ?? "")
+                let sub = NSMenu(); partActions(sub, p.part); row.submenu = sub
+                menu.addItem(row)
             }
-            menu.addItem(.separator())
         }
 
+        if !model.simulators.isEmpty {
+            menu.addItem(.separator())
+            header("iOS Simulators running")
+            for sim in model.simulators {
+                let row = twoLine(dot: "◆", dotColor: .systemBlue, title: sim.name, right: fmtBytes(sim.mem),
+                                  sub: (sim.apps.isEmpty ? "No app open" : "Running " + sim.apps.joined(separator: ", "))
+                                    + " · booted \(fmtAgo(Date().timeIntervalSince(sim.started))) ago")
+                let sub = NSMenu()
+                subInfo(sub, "Simulators keep running after Claude's build/test is done.")
+                subAction(sub, "Shut down \(sim.name)") { shutdownSimulator(sim.udid) }
+                row.submenu = sub
+                menu.addItem(row)
+            }
+            if model.simulators.count > 1 {
+                action("Shut down all simulators") { for s in model.simulators { shutdownSimulator(s.udid) } }
+            }
+        }
+
+        // The one-click cleanup.
+        let stopSessions = done
+        let stopOrphans = model.orphans.map(\.part)
+        let freed = stopSessions.map(\.mem).reduce(0, +) + stopOrphans.map(\.mem).reduce(0, +)
+        if !stopSessions.isEmpty || !stopOrphans.isEmpty {
+            menu.addItem(.separator())
+            var what: [String] = []
+            if !stopSessions.isEmpty { what.append("\(stopSessions.count) finished session\(stopSessions.count == 1 ? "" : "s")") }
+            if !stopOrphans.isEmpty { what.append("\(stopOrphans.count) leftover\(stopOrphans.count == 1 ? "" : "s")") }
+            let i = action("Stop \(what.joined(separator: " + ")) — frees \(fmtBytes(freed))") {
+                for s in stopSessions { killTree(s.pids) }
+                for o in stopOrphans { killTree(o.pids) }
+            }
+            i.attributedTitle = NSAttributedString(string: i.title, attributes: [.font: NSFont.boldSystemFont(ofSize: 13)])
+            info("Stopped chats stay in the Claude sidebar and pick up where they left off when you open them.")
+        }
+
+        // A tip when the same plug-in is duplicated across many sessions.
+        var plugins: [String: (count: Int, mem: UInt64)] = [:]
+        for p in model.sessions.flatMap(\.parts) where p.kind == .plugin {
+            plugins[p.label, default: (0, 0)].count += 1; plugins[p.label, default: (0, 0)].mem += p.mem
+        }
+        let dupes = plugins.filter { $0.value.count >= 3 }.sorted { $0.value.mem > $1.value.mem }
+        if !dupes.isEmpty { menu.addItem(.separator()) }
+        for (label, v) in dupes {
+            info("Tip: \(v.count) sessions each run their own \(label.replacingOccurrences(of: "Tool plug-in: ", with: "")) (\(fmtBytes(v.mem)) total).")
+            info("      Turn it off in projects that don't need it to save that memory.")
+        }
+
+        menu.addItem(.separator())
+        let appSub = NSMenu()
+        subInfo(appSub, "The Claude window and its built-in helpers. Not affected by stopping sessions.")
+        appSub.addItem(.separator())
+        for p in model.app.parts.prefix(14) { subInfo(appSub, "\(p.label) — \(fmtBytes(p.mem))" + cpuNote(p.cpu)) }
+        let appRow = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        appRow.attributedTitle = tabbed("Claude app window" + cpuNote(model.app.cpu), fmtBytes(model.app.mem))
+        appRow.submenu = appSub
+        menu.addItem(appRow)
+        let m = memStats()
+        info("Mac memory: \(fmtBytes(m.used)) of \(fmtBytes(m.total)) used · pressure \(m.pressureName)")
+        menu.addItem(.separator())
         action("Open Activity Monitor") { NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app")) }
         action("Quit ProcBar") { NSApp.terminate(nil) }
+    }
+
+    func sessionMenu(_ s: SessionInfo) -> NSMenu {
+        let sub = NSMenu()
+        let st = status(s)
+        subHeader(sub, st.text)
+        if let f = s.folder { subInfo(sub, tilde(f) + (s.branch.map { " · branch \($0)" } ?? "")) }
+        subInfo(sub, (s.fromDesktop ? "Claude app" : "Terminal") + " · open \(fmtAgo(Date().timeIntervalSince(s.proc.started)))"
+                + (s.permissionMode.map { " · \($0) mode" } ?? "") + cpuNote(s.cpu))
+        sub.addItem(.separator())
+        subHeader(sub, "What it's running")
+        for p in s.parts {
+            let i = NSMenuItem(title: p.label, action: nil, keyEquivalent: "")
+            i.attributedTitle = tabbed(p.label + portNote(p.ports), fmtBytes(p.mem) + (p.cpu >= 1 ? String(format: " · %.0f%%", p.cpu) : ""),
+                                       width: 460, size: 12, note: p.explain)
+            if p.kind != .agent {
+                let ps = NSMenu()
+                subInfo(ps, clip(p.proc.cmdline, 100))
+                ps.addItem(.separator())
+                partActions(ps, p, warn: p.kind == .plugin ? "Claude loses these tools in this chat until it restarts." : nil)
+                i.submenu = ps
+            }
+            sub.addItem(i)
+        }
+        sub.addItem(.separator())
+        subAction(sub, "Stop this session and everything it started (frees \(fmtBytes(s.mem)))") { [weak self] in
+            if s.isBusy, self?.confirm("“\(s.title)” is working right now. Stop it anyway?",
+                                       "Its current turn will be cut off. The chat stays in the Claude sidebar and restarts when you open it.") != true { return }
+            killTree(s.pids)
+        }
+        if s.fromDesktop { subInfo(sub, "The chat stays in the Claude sidebar and resumes when you open it.") }
+        return sub
+    }
+
+    func partActions(_ m: NSMenu, _ p: Part, warn: String? = nil) {
+        for port in p.ports.prefix(2) {
+            subAction(m, "Open http://localhost:\(port)") { NSWorkspace.shared.open(URL(string: "http://localhost:\(port)")!) }
+        }
+        subAction(m, "Stop (frees \(fmtBytes(p.mem)))") { killTree(p.pids) }
+        if let warn { subInfo(m, warn) }
     }
 
     // MARK: menu helpers
 
     func cpuNote(_ cpu: Double) -> String { cpu >= 5 ? String(format: " · %.0f%% CPU", cpu) : "" }
+    func portNote(_ ports: [Int]) -> String { ports.isEmpty ? "" : " · " + ports.prefix(3).map { ":\($0)" }.joined(separator: " ") }
 
-    func tabbed(_ left: String, _ right: String, bold: Bool = false) -> NSAttributedString {
+    func tabbed(_ left: String, _ right: String, bold: Bool = false, width: CGFloat = 440, size: CGFloat = 13, note: String? = nil) -> NSAttributedString {
         let ps = NSMutableParagraphStyle()
-        ps.tabStops = [NSTextTab(textAlignment: .right, location: 420)]
-        return NSAttributedString(string: left + "\t" + right, attributes: [
-            .paragraphStyle: ps,
-            .font: bold ? NSFont.boldSystemFont(ofSize: 13) : NSFont.menuFont(ofSize: 13)])
-    }
-
-    func ledger(_ name: String, _ bytes: UInt64, _ sub: NSMenu? = nil) {
-        let i = NSMenuItem(title: name, action: nil, keyEquivalent: "")
-        i.attributedTitle = tabbed("    " + name, fmtBytes(bytes))
-        i.submenu = sub
-        menu.addItem(i)
-    }
-
-    /// Targets the app by bundle, not by pid: the group's pids include helpers, renderers and widget extensions,
-    /// and killing one of those leaves the app running. With no main app (e.g. only widgets), kill the whole group.
-    func appMenu(_ bundle: String, _ pids: [pid_t]) -> NSMenu {
-        let sub = NSMenu()
-        func running() -> NSRunningApplication? {
-            NSWorkspace.shared.runningApplications.first { $0.bundleURL?.path == bundle }
+        ps.tabStops = [NSTextTab(textAlignment: .right, location: width)]
+        let s = NSMutableAttributedString(string: left + "\t" + right, attributes: [
+            .paragraphStyle: ps, .font: bold ? NSFont.boldSystemFont(ofSize: size) : NSFont.menuFont(ofSize: size)])
+        if let note {
+            s.append(NSAttributedString(string: "\n" + note, attributes: [
+                .font: NSFont.menuFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]))
         }
-        subAction(sub, "Quit") { if running()?.terminate() == nil { for p in pids { kill(p, SIGTERM) } } }
-        subAction(sub, "Force Quit") { if running()?.forceTerminate() != true { for p in pids { kill(p, SIGKILL) } } }
-        return sub
+        return s
+    }
+
+    /// "● Title ……… 340 MB" over a smaller grey line saying what it's doing.
+    func twoLine(dot: String, dotColor: NSColor, title: String, right: String, sub: String) -> NSMenuItem {
+        let i = NSMenuItem(title: "\(dot) \(title) — \(right)\n    \(sub)", action: nil, keyEquivalent: "")
+        let ps = NSMutableParagraphStyle()
+        ps.tabStops = [NSTextTab(textAlignment: .right, location: 440)]
+        ps.headIndent = 18
+        let s = NSMutableAttributedString(string: dot + "\t", attributes: [.foregroundColor: dotColor, .font: NSFont.boldSystemFont(ofSize: 13)])
+        let ps2 = ps.mutableCopy() as! NSMutableParagraphStyle
+        ps2.tabStops = [NSTextTab(textAlignment: .left, location: 18), NSTextTab(textAlignment: .right, location: 440)]
+        s.append(NSAttributedString(string: title + "\t" + right, attributes: [.font: NSFont.menuFont(ofSize: 13)]))
+        s.append(NSAttributedString(string: "\n" + sub, attributes: [.font: NSFont.menuFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]))
+        s.addAttribute(.paragraphStyle, value: ps2, range: NSRange(location: 0, length: s.length))
+        i.attributedTitle = s
+        return i
     }
 
     func header(_ s: String) {
@@ -711,13 +942,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .font: NSFont.menuFont(ofSize: 12), .foregroundColor: NSColor.secondaryLabelColor])
         m.addItem(i)
     }
-    func action(_ s: String, _ f: @escaping () -> Void) { subAction(menu, s, f) }
-    func subAction(_ m: NSMenu, _ s: String, _ f: @escaping () -> Void) {
+    @discardableResult func action(_ s: String, _ f: @escaping () -> Void) -> NSMenuItem { subAction(menu, s, f) }
+    @discardableResult func subAction(_ m: NSMenu, _ s: String, _ f: @escaping () -> Void) -> NSMenuItem {
         let i = NSMenuItem(title: s, action: #selector(run(_:)), keyEquivalent: "")
         i.target = self
         i.tag = actions.count
         actions.append(f)
         m.addItem(i)
+        return i
     }
     @objc func run(_ sender: NSMenuItem) {
         let f = actions[sender.tag]
@@ -734,7 +966,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
         a.messageText = title; a.informativeText = text
-        a.addButton(withTitle: "Force Quit"); a.addButton(withTitle: "Cancel")
+        a.addButton(withTitle: "Stop"); a.addButton(withTitle: "Cancel")
         return a.runModal() == .alertFirstButtonReturn
     }
 }
@@ -748,8 +980,10 @@ if CommandLine.arguments.contains("--dump") {
     Thread.sleep(forTimeInterval: 2)
     delegate.menuNeedsUpdate(delegate.menu)
     func walk(_ m: NSMenu, _ depth: Int) {
+        let pad = String(repeating: "    ", count: depth)
         for i in m.items {
-            print(String(repeating: "    ", count: depth) + (i.isSeparatorItem ? "—" : i.title))
+            let text = i.isSeparatorItem ? "—" : (i.attributedTitle?.string ?? i.title).replacingOccurrences(of: "\t", with: "  ")
+            print(pad + text.replacingOccurrences(of: "\n", with: "\n" + pad + "  "))
             if let s = i.submenu { walk(s, depth + 1) }
         }
     }
