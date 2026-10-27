@@ -17,7 +17,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
 fi
 
 mkdir -p "$APP/Contents/MacOS" build
-xcrun swiftc -O -swift-version 5 -o "$APP/Contents/MacOS/ProcBar" Sources/main.swift
+xcrun swiftc -O -swift-version 5 -o "$APP/Contents/MacOS/ProcBar" Sources/*.swift
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

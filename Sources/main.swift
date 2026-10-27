@@ -525,6 +525,8 @@ final class Model {
             + unmatchedPreviews.map(\.part.mem).reduce(0, +) + app.mem
     }
 
+    init() {}
+
     init(procs: [pid_t: Proc]) {
         var children: [pid_t: [pid_t]] = [:]
         for p in procs.values { children[p.ppid, default: []].append(p.pid) }
@@ -653,6 +655,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var cpuSample: [pid_t: (UInt64, Date)] = [:]
     var sessionCount = 0
     var actions: [() -> Void] = []
+    var demo: Model?  // made-up sessions for screenshots (`--demo`)
 
     func applicationDidFinishLaunching(_ n: Notification) {
         menu.delegate = self
@@ -732,9 +735,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         actions.removeAll()
-        let procs = snapshot(prevCpu: cpuSample)
-        cpuSample = procs.mapValues { ($0.cpuNs, Date()) }
-        let model = Model(procs: procs)
+        let model: Model
+        if let demo { model = demo } else {
+            let procs = snapshot(prevCpu: cpuSample)
+            cpuSample = procs.mapValues { ($0.cpuNs, Date()) }
+            model = Model(procs: procs)
+        }
         sessionCount = model.sessions.count
         updateTitle()
 
@@ -989,6 +995,14 @@ if CommandLine.arguments.contains("--dump") {
     }
     walk(delegate.menu, 0)
     exit(0)
+}
+
+// `ProcBar --demo <dir>` fills the menu with made-up sessions and saves screenshots of it there.
+if let i = CommandLine.arguments.firstIndex(of: "--demo") {
+    let dir = i + 1 < CommandLine.arguments.count ? CommandLine.arguments[i + 1] : "docs"
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { captureDemo(delegate, to: dir) }
+    app.run()
 }
 
 app.delegate = delegate
